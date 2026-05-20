@@ -1,14 +1,17 @@
 ﻿const express = require('express');
 const router = express.Router();
 const { PrismaClient } = require('@prisma/client');
-const { generateReport } = require('../controllers/report.controller');
+const { generateReport, generateReportMulti } = require('../controllers/report.controller');
 const path = require('path');
 const fs = require('fs');
 
 const prisma = new PrismaClient();
 
-// POST /api/reports/generate
+// POST /api/reports/generate — один документ
 router.post('/generate', generateReport);
+
+// 🔥 POST /api/reports/generate-multi — НЕСКОЛЬКО документов как один
+router.post('/generate-multi', generateReportMulti);
 
 // GET /api/reports — список отчётов
 router.get('/', async (req, res) => {
@@ -34,15 +37,10 @@ router.get('/', async (req, res) => {
     }
 });
 
-// GET /api/reports/:filename — отдаём файл из public/reports
 router.get('/:filename', async (req, res) => {
     try {
         const filePath = path.join(__dirname, '../../public/reports', req.params.filename);
-
-        if (!fs.existsSync(filePath)) {
-            return res.status(404).json({ error: 'Файл не найден' });
-        }
-
+        if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Файл не найден' });
         res.download(filePath);
     } catch (error) {
         console.error('Download error:', error);

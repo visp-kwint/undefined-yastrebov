@@ -10,7 +10,7 @@ import {
   apiUpdateSessionTitle, apiDeleteSession,
   uploadFileToBackend, loadDocumentsFromBackend,
   apiAskQuestion, apiGenerateReport, apiRunCommand,
-  apiUpdateSessionDocuments 
+  apiUpdateSessionDocuments, apiGenerateReportMulti
 } from "./api";
 import { renderReport } from "./reportRenderer";
 import {
@@ -320,6 +320,16 @@ export function processAiText(input: string): string {
   if (!input) return "";
 
   let t = String(input);
+
+  t = t.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  t = t.replace(/\u200B|\uFEFF/g, "");
+
+  t = t.replace(/(\.[a-zA-Z]{2,4})([А-ЯA-Z])/g, "$1\n\n$2");  
+  t = t.replace(/([а-яa-z])\.([А-ЯA-Z][а-яa-zА-ЯA-Z])/g, "$1.\n\n$2"); 
+  t = t.replace(/([а-яё]{3,})([А-Я][а-яё])/g, "$1\n\n$2");  
+  t = t.replace(/(показатели:)/gi, "$1\n");
+  t = t.replace(/(Распознано:)/g, "\n$1");
+  t = t.replace(/\n{4,}/g, "\n\n\n");
 
   t = t.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   t = t.replace(/\u200B|\uFEFF/g, "");
@@ -888,27 +898,38 @@ export default function Home() {
     }, [addMessageToSession, removeTempMessage]);
   
     const askReport = useCallback(async (docIds: string[]) => {
-      await addMessageToSession("ai", "Генерирую отчёт...");
-      try {
-        const documentId = docIds.length ? docIds[docIds.length - 1] : null;
-        if (!documentId) { removeTempMessage(); await addMessageToSession("ai", "Нет загруженных документов."); return; }
-        const reportData = await apiGenerateReport(documentId, "all");
-        removeTempMessage();
-        if (reportData.success) await addMessageToSession("ai", renderReport(reportData.data), true);
-        else await addMessageToSession("ai", "Ошибка: " + (reportData.error || "Не удалось сгенерировать отчёт."));
-      } catch { removeTempMessage(); await addMessageToSession("ai", "Ошибка при генерации отчёта."); }
+      if (!docIds.length) {
+        await addMessageToSession("ai", "Нет загруженных документов.");
+        return;
+      }
+    
+      await addMessageToSession("ai", "Обрабатываю...");
+    
+      // 🔥 Если документов больше одного — используем multi-эндпоинт
+      const reportData = docIds.length > 1
+        ? await apiGenerateReportMulti(docIds, "all")
+        : await apiGenerateReport(docIds[0], "all");
+    
+      removeTempMessage();
+      if (reportData.success) {
+        await addMessageToSession("ai", renderReport(reportData.data), true);
+      } else {
+        await addMessageToSession("ai", "Ошибка: " + (reportData.error || "Не удалось сгенерировать отчёт."));
+      }
     }, [addMessageToSession, removeTempMessage]);
-  
+    
     const askChart = useCallback(async (docIds: string[]) => {
+      if (!docIds.length) {
+        await addMessageToSession("ai", "Нет загруженных документов.");
+        return;
+      }
       await addMessageToSession("ai", "Строю диаграмму...");
-      try {
-        const documentId = docIds.length ? docIds[docIds.length - 1] : null;
-        if (!documentId) { removeTempMessage(); await addMessageToSession("ai", "Нет загруженных документов."); return; }
-        const reportData = await apiGenerateReport(documentId, "charts");
-        removeTempMessage();
-        if (reportData.success) await addMessageToSession("ai", renderReport(reportData.data), true);
-        else await addMessageToSession("ai", "Ошибка: " + (reportData.error || "Не удалось построить диаграмму."));
-      } catch { removeTempMessage(); await addMessageToSession("ai", "Ошибка."); }
+      const reportData = docIds.length > 1
+        ? await apiGenerateReportMulti(docIds, "charts")
+        : await apiGenerateReport(docIds[0], "charts");
+      removeTempMessage();
+      if (reportData.success) await addMessageToSession("ai", renderReport(reportData.data), true);
+      else await addMessageToSession("ai", "Ошибка: " + (reportData.error || "Не удалось построить диаграмму."));
     }, [addMessageToSession, removeTempMessage]);
   
     const askSummary = useCallback(async (docIds: string[]) => {
@@ -924,15 +945,17 @@ export default function Home() {
     }, [addMessageToSession, removeTempMessage]);
   
     const askExport = useCallback(async (docIds: string[], type: string) => {
+      if (!docIds.length) {
+        await addMessageToSession("ai", "Нет загруженных документов.");
+        return;
+      }
       await addMessageToSession("ai", "Генерирую файл...");
-      try {
-        const documentId = docIds.length ? docIds[docIds.length - 1] : null;
-        if (!documentId) { removeTempMessage(); await addMessageToSession("ai", "Нет загруженных документов."); return; }
-        const reportData = await apiGenerateReport(documentId, type);
-        removeTempMessage();
-        if (reportData.success) await addMessageToSession("ai", renderReport(reportData.data), true);
-        else await addMessageToSession("ai", "Ошибка: " + (reportData.error || "Не удалось создать файл."));
-      } catch { removeTempMessage(); await addMessageToSession("ai", "Ошибка."); }
+      const reportData = docIds.length > 1
+        ? await apiGenerateReportMulti(docIds, type)
+        : await apiGenerateReport(docIds[0], type);
+      removeTempMessage();
+      if (reportData.success) await addMessageToSession("ai", renderReport(reportData.data), true);
+      else await addMessageToSession("ai", "Ошибка: " + (reportData.error || "Не удалось создать файл."));
     }, [addMessageToSession, removeTempMessage]);
   
     const routeAiRequest = useCallback(async (text: string, docIds: string[]) => {
@@ -959,8 +982,13 @@ export default function Home() {
     
       if (["report", "chart", "excel", "pdf"].includes(command)) {
         const typeMap: Record<string, string> = { report: "all", chart: "charts", excel: "excel", pdf: "pdf" };
-        await addMessageToSession("ai", "Генерирую отчёт...");
-        const reportData = await apiGenerateReport(documentId!, typeMap[command]);
+        await addMessageToSession("ai", "Обрабатываю...");
+      
+        // 🔥 Если документов больше одного — multi
+        const reportData = ids.length > 1
+          ? await apiGenerateReportMulti(ids, typeMap[command])
+          : await apiGenerateReport(documentId!, typeMap[command]);
+      
         removeTempMessage();
         if (reportData.success) await addMessageToSession("ai", renderReport(reportData.data), true);
         else await addMessageToSession("ai", "Ошибка: " + (reportData.error || "Не удалось сгенерировать."));

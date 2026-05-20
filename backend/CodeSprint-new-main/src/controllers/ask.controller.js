@@ -29,7 +29,7 @@ async function axiosPostWithRetry(url, data, headers, maxRetries = 3) {
     try {
       return await axios.post(url, data, {
         headers,
-        timeout: 60000,
+        timeout: 240000,
         httpAgent,
         httpsAgent
       });

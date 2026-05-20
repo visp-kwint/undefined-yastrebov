@@ -77,7 +77,13 @@ async function extractText(filePath, mimeType, originalName) {
       mimeType === 'image/jpeg' ||
       mimeType === 'image/png'
     ) {
-      if (extractTextFromImage) return (await extractTextFromImage(filePath)) || '';
+      if (extractTextFromImage) {
+        console.log(`[document.service] Запуск OCR для ${originalName}...`);
+        const result = await extractTextFromImage(filePath);
+        console.log(`[document.service] OCR вернул ${(result || '').length} симв.`);
+        return result || '';
+      }
+      console.warn('[document.service] OCR-сервис не доступен для изображения!');
       return '';
     }
 
