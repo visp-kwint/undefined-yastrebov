@@ -13,7 +13,17 @@ router.post('/generate', generateReport);
 // GET /api/reports — список отчётов
 router.get('/', async (req, res) => {
     try {
+        const jwt = require('jsonwebtoken');
+        const JWT_SECRET = process.env.JWT_SECRET || 'docmind-secret-key-change-in-production';
+        const authHeader = req.headers.authorization;
+        if (!authHeader) return res.status(401).json({ success: false, error: 'Требуется авторизация' });
+        let userId;
+        try {
+            userId = jwt.verify(authHeader.replace('Bearer ', ''), JWT_SECRET).userId;
+        } catch { return res.status(401).json({ success: false, error: 'Невалидный токен' }); }
+
         const reports = await prisma.report.findMany({
+            where: { userId },
             orderBy: { createdAt: 'desc' },
             take: 50
         });

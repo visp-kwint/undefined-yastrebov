@@ -1,90 +1,172 @@
+const fs = require('fs');
 const path = require('path');
-const prisma = require('./prisma.service');
-const pdfService = require('./pdf.service');
-const ocrService = require('./ocr.service');
-const wordService = require('./word.service');
-const excelService = require('./excel.service');
-const AppError = require('../utils/AppError');
+const { PrismaClient } = require('@prisma/client');
+const prisma = new PrismaClient();
 
-async function processUploadedFile(file) {
-  const extension = path.extname(file.originalname).toLowerCase();
-  let extractedText = '';
-  let status = 'processed';
+const { extractTextFromWord } = require('./word.service');
+
+// PDF
+let extractTextFromPdf = null;
+try {
+  const pdfSvc = require('./pdf.service');
+  extractTextFromPdf = pdfSvc.extractTextFromPdf || pdfSvc.default || pdfSvc;
+  if (typeof extractTextFromPdf !== 'function') extractTextFromPdf = null;
+} catch (e) {
+  console.log('[document.service] PDF-сервис не подключён:', e.message);
+}
+
+// Excel
+let extractTextFromExcel = null;
+try {
+  const xlsSvc = require('./excel.service');
+  extractTextFromExcel = xlsSvc.extractTextFromExcel || xlsSvc.default || xlsSvc;
+  if (typeof extractTextFromExcel !== 'function') extractTextFromExcel = null;
+} catch (e) {
+  console.log('[document.service] Excel-сервис не подключён:', e.message);
+}
+
+// OCR (изображения)
+let extractTextFromImage = null;
+try {
+  const ocrSvc = require('./ocr.service');
+  extractTextFromImage = ocrSvc.extractTextFromImage || ocrSvc.default || ocrSvc;
+  if (typeof extractTextFromImage !== 'function') extractTextFromImage = null;
+} catch (e) {
+  console.log('[document.service] OCR-сервис не подключён:', e.message);
+}
+
+async function extractText(filePath, mimeType, originalName) {
+  const ext = path.extname(originalName || filePath).toLowerCase();
 
   try {
-    if (file.mimetype === 'application/pdf') {
-      extractedText = await pdfService.extractTextFromPdf(file.path);
-      if (!extractedText || extractedText.trim().length < 10) {
-          console.log('PDF без текстового слоя — скан без OCR поддержки');
-          extractedText = '';
-          status = 'no_text';
+    // DOCX
+    if (
+      ext === '.docx' ||
+      mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    ) {
+      if (typeof extractTextFromWord !== 'function') {
+        throw new Error('extractTextFromWord не функция (проверь word.service.js)');
       }
-    } else if (
-      file.mimetype === 'image/jpeg' ||
-      file.mimetype === 'image/png'
-    ) {
-      extractedText = await ocrService.extractTextFromImage(file.path);
-    } else if (
-      file.mimetype === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-    ) {
-      extractedText = await wordService.extractTextFromWord(file.path);
-    } else if (
-      file.mimetype === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' ||
-      file.mimetype === 'application/vnd.ms-excel'
-    ) {
-      extractedText = await excelService.extractTextFromExcel(file.path);
-    } else if (
-      file.mimetype === 'text/plain' ||
-      file.mimetype === 'text/csv'
-    ) {
-      const fs = require('fs');
-      extractedText = fs.readFileSync(file.path, 'utf8');
-    } else {
-      throw new AppError('Неподдерживаемый тип файла', 400);
+      return (await extractTextFromWord(filePath)) || '';
     }
 
-    if (!extractedText || !extractedText.trim()) {
-      extractedText = '';
+    // PDF
+    if (ext === '.pdf' || mimeType === 'application/pdf') {
+      if (extractTextFromPdf) return (await extractTextFromPdf(filePath)) || '';
+      return '';
     }
-  } catch (error) {
-    console.error('Ошибка обработки файла:', error.message);
+
+    // Excel
+    if (
+      ['.xlsx', '.xls'].includes(ext) ||
+      mimeType === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' ||
+      mimeType === 'application/vnd.ms-excel'
+    ) {
+      if (extractTextFromExcel) return (await extractTextFromExcel(filePath)) || '';
+      return '';
+    }
+
+    // TXT / CSV
+    if (['.txt', '.csv'].includes(ext) || mimeType === 'text/plain' || mimeType === 'text/csv') {
+      return fs.readFileSync(filePath, 'utf8');
+    }
+
+    // Изображения
+    if (
+      ['.jpg', '.jpeg', '.png'].includes(ext) ||
+      mimeType === 'image/jpeg' ||
+      mimeType === 'image/png'
+    ) {
+      if (extractTextFromImage) return (await extractTextFromImage(filePath)) || '';
+      return '';
+    }
+
+    console.log('[document.service] Неизвестный тип файла:', ext, mimeType);
+    return '';
+  } catch (err) {
+    console.error(`[document.service] Ошибка извлечения (${ext}):`, err.message);
+    return '';
+  }
+}
+
+/**
+ * Сохраняет загруженный multer-файл в БД и извлекает текст.
+ * Соответствует prisma-схеме (storedName, extension, extractedText@map text и т.д.)
+ */
+async function processUploadedFile(file, userId) {
+  const filePath = file.path;
+  const originalName = file.originalname;
+  const mimeType = file.mimetype;
+  const size = file.size;
+  const ext = path.extname(originalName || '').toLowerCase().replace('.', '') || 'unknown';
+  const storedName = file.filename || path.basename(filePath);
+
+  let extractedText = '';
+  let status = 'processed';
+  let errorText = null;
+
+  try {
+    extractedText = await extractText(filePath, mimeType, originalName);
+    if (!extractedText || !extractedText.trim()) {
+      status = 'no_text';
+    }
+  } catch (e) {
     status = 'error';
-    extractedText = '';
+    errorText = e.message;
   }
 
-  const fileUrl = `/uploads/${file.filename}`;
-
-  const documentRecord = await prisma.document.create({
+  const document = await prisma.document.create({
     data: {
-      originalName: file.originalname,
-      storedName: file.filename,
-      mimeType: file.mimetype,
-      extension,
-      size: file.size,
-      filePath: file.path,
-      fileUrl,
+      userId: userId || null,
+      originalName,
+      storedName,
+      mimeType,
+      extension: ext,
+      size,
+      filePath,
       extractedText,
-      status
+      status,
+      error: errorText
     }
   });
 
-  return documentRecord;
+  console.log(
+    `[document.service] Файл загружен: ${originalName} ` +
+    `(${(size / 1024).toFixed(1)} KB), статус: ${status}, ` +
+    `текста: ${(extractedText || '').length} симв., userId: ${userId || '-'}`
+  );
+
+  return document;
 }
 
-async function getDocumentById(documentId) {
-  return prisma.document.findUnique({
-    where: { id: documentId }
-  });
-}
-
-async function getAllDocuments() {
+async function getDocuments(userId) {
   return prisma.document.findMany({
+    where: { userId },
     orderBy: { createdAt: 'desc' }
   });
 }
 
+async function getDocumentById(id, userId) {
+  return prisma.document.findFirst({ where: { id, userId } });
+}
+
+async function deleteDocument(id, userId) {
+  const doc = await prisma.document.findFirst({ where: { id, userId } });
+  if (!doc) return null;
+  try {
+    if (doc.filePath && fs.existsSync(doc.filePath)) fs.unlinkSync(doc.filePath);
+  } catch (e) {
+    console.error('[document.service] Не удалось удалить файл:', e.message);
+  }
+  await prisma.document.delete({ where: { id } });
+  return doc;
+}
+
 module.exports = {
-  processUploadedFile,
+  processUploadedFile, // ← главное имя, которое ждёт upload.controller
+  uploadDocument: processUploadedFile, // алиас на всякий случай
+  getDocuments,
   getDocumentById,
-  getAllDocuments
+  deleteDocument,
+  extractText
 };

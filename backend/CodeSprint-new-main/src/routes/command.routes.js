@@ -3,6 +3,17 @@ const router = express.Router();
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
 
+const jwt = require('jsonwebtoken');
+const JWT_SECRET = process.env.JWT_SECRET || 'docmind-secret-key-change-in-production';
+
+function getUserIdFromReq(req) {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) return null;
+    try {
+        return jwt.verify(authHeader.replace('Bearer ', ''), JWT_SECRET).userId;
+    } catch { return null; }
+}
+
 // POST /api/commands/run
 router.post('/run', async (req, res) => {
     try {
@@ -12,9 +23,14 @@ router.post('/run', async (req, res) => {
             return res.status(400).json({ success: false, error: 'Команда и ID документа обязательны' });
         }
 
-        const doc = await prisma.document.findUnique({ where: { id: documentId } });
+        const userId = getUserIdFromReq(req);
+        if (!userId) {
+            return res.status(401).json({ success: false, error: 'Требуется авторизация' });
+        }
+
+        const doc = await prisma.document.findFirst({ where: { id: documentId, userId } });
         if (!doc) {
-            return res.status(404).json({ success: false, error: 'Документ не найден' });
+            return res.status(404).json({ success: false, error: 'Документ не найден или нет доступа' });
         }
 
         let result = {};

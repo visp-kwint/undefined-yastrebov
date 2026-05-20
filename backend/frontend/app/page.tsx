@@ -9,7 +9,8 @@ import {
   apiLoadSessions, apiCreateSession, apiSaveMessage,
   apiUpdateSessionTitle, apiDeleteSession,
   uploadFileToBackend, loadDocumentsFromBackend,
-  apiAskQuestion, apiGenerateReport, apiRunCommand
+  apiAskQuestion, apiGenerateReport, apiRunCommand,
+  apiUpdateSessionDocuments 
 } from "./api";
 import { renderReport } from "./reportRenderer";
 import {
@@ -25,6 +26,7 @@ import {
   SparkleIcon, StarIcon, getFileIconComponent
 } from "./components/AppIcons";
 
+
 // ── Chevron ─────────────────────────────────────────────────────────────
 const ChevronIcon = ({ open }: { open: boolean }) => (
   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -37,28 +39,77 @@ const ChevronIcon = ({ open }: { open: boolean }) => (
 // ── Format AI text ──────────────────────────────────────────────────────
 // ── Helpers для распознавания специальных блоков ─────────────────────────
 
-function escapeHtmlStr(text: string): string {
-  return text
+function escapeHtmlStr(s: string): string {
+  return String(s)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
-// Распознаёт markdown-таблицу: | a | b | \n |---|---| \n | 1 | 2 |
-function parseMarkdownTable(lines: string[], startIdx: number): { html: string; consumed: number } | null {
+
+// Инлайн-форматирование: жирный, числа -> зелёная плашка
+function inlineFormat(s: string): string {
+  let html = escapeHtmlStr(s);
+
+  // Денежные/числовые значения: 38 903, 299 250, 80 000, 12.5, 1 234.56
+  html = html.replace(
+    /(?<![\w>=])(\d{1,3}(?:[ \u00A0]\d{3})+(?:[.,]\d+)?|\d+(?:[.,]\d+)?)(?![\w<])/g,
+    '<span class="ai-num">$1</span>'
+  );
+
+  // **жирный**
+  html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  // *курсив*
+  html = html.replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,!?:;]|$)/g, "$1<em>$2</em>");
+  // `код`
+  html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+
+  return html;
+}
+
+function buildTableHtml(headers: string[], rows: string[][]): string {
+  let html = '<div class="ai-table-wrapper"><table class="ai-table"><thead><tr>';
+  headers.forEach(h => {
+    html += `<th>${escapeHtmlStr(h)}</th>`;
+  });
+  html += "</tr></thead><tbody>";
+  rows.forEach(row => {
+    html += "<tr>";
+    row.forEach((cell, idx) => {
+      const trimmed = cell.trim();
+      const isNumber =
+        idx > 0 &&
+        trimmed.length > 0 &&
+        /^[\d\s.,\u00A0%+-]+$/.test(trimmed) &&
+        /\d/.test(trimmed);
+      html += `<td${isNumber ? ' class="num"' : ""}>${inlineFormat(trimmed)}</td>`;
+    });
+    html += "</tr>";
+  });
+  html += "</tbody></table></div>";
+  return html;
+}
+
+// Полноценная markdown-таблица: шапка + |---|---|
+function parseMarkdownTable(
+  lines: string[],
+  startIdx: number
+): { html: string; consumed: number } | null {
   if (startIdx >= lines.length) return null;
   const first = lines[startIdx].trim();
   if (!first.startsWith("|") || !first.endsWith("|")) return null;
 
-  const headers = first.slice(1, -1).split("|").map(c => c.trim());
+  const headers = first
+    .slice(1, -1)
+    .split("|")
+    .map(c => c.trim());
   if (headers.length < 2) return null;
 
   if (startIdx + 1 >= lines.length) return null;
   const sep = lines[startIdx + 1].trim();
-  // Разделитель: |---|---|---| или | --- | --- |
   if (!/^\|[\s\-:|]+\|$/.test(sep)) return null;
-  // Проверка что в разделителе есть хотя бы 2 группы дефисов
   const sepParts = sep.slice(1, -1).split("|");
   if (sepParts.length !== headers.length) return null;
   if (!sepParts.every(p => /^[\s\-:]+$/.test(p) && p.includes("-"))) return null;
@@ -75,239 +126,320 @@ function parseMarkdownTable(lines: string[], startIdx: number): { html: string; 
   }
   if (rows.length === 0) return null;
 
-  let html = '<div class="ai-table-wrapper"><table class="ai-table"><thead><tr>';
-  headers.forEach(h => { html += `<th>${escapeHtmlStr(h)}</th>`; });
-  html += "</tr></thead><tbody>";
-  rows.forEach(row => {
-    html += "<tr>";
-    row.forEach((cell, idx) => {
-      const isNumber = /^[\d\s.,]+$/.test(cell) && cell.length > 0 && idx > 0;
-      html += `<td${isNumber ? ' class="num"' : ''}>${escapeHtmlStr(cell)}</td>`;
-    });
-    html += "</tr>";
-  });
-  html += "</tbody></table></div>";
-
-  return { html, consumed: i - startIdx };
+  return { html: buildTableHtml(headers, rows), consumed: i - startIdx };
 }
 
-// Распознаёт строки вида:
-// "Иванов И.И. | ████████ 80000"
-// "[80 000] | Иванов И.И."  
-// "Иванов И.И. ████████ 80 000"
-// "Всего расходов: [427 928] руб."
-type BarLine = { label: string; value: number; rawValue: string; unit: string };
-
-function parseBarLine(line: string): BarLine | null {
-  const cleaned = line.replace(/[█▓▒░|]+/g, " ").replace(/\s+/g, " ").trim();
-  if (!cleaned) return null;
-
-  // Паттерн 1: "Метка [число] единица"  или "Метка: [число]"
-  let m = cleaned.match(/^(.+?)\s*[:|]?\s*\[([\d\s,.]+)\]\s*(.*)$/);
-  if (m) {
-    const [, label, val, unit] = m;
-    const num = parseFloat(val.replace(/[\s,]/g, ""));
-    if (!isNaN(num)) {
-      return { label: label.trim(), value: num, rawValue: val.trim(), unit: unit.trim() };
-    }
-  }
-
-  // Паттерн 2: "Метка 80 000" или "Метка: 80000"
-  m = cleaned.match(/^(.+?)\s*[:|]?\s+(\d[\d\s.,]*)\s*(руб\.?|%|шт\.?)?\s*$/i);
-  if (m) {
-    const [, label, val, unit] = m;
-    const num = parseFloat(val.replace(/[\s,]/g, ""));
-    if (!isNaN(num) && num > 0 && label.length > 1) {
-      return { label: label.trim(), value: num, rawValue: val.trim(), unit: (unit || "").trim() };
-    }
-  }
-
-  return null;
-}
-
-// Распознаём блок ASCII-диаграммы (есть символы █ или несколько одинаковых строк-баров)
-function isLikelyBarLine(line: string): boolean {
-  const trimmed = line.trim();
-  if (!trimmed) return false;
-  // Содержит блочные символы
-  if (/[█▓▒░]{2,}/.test(trimmed)) return true;
-  return false;
-}
-
-// ── ГЛАВНАЯ функция: обрабатывает AI-текст ───────────────────────────────
-function processAiText(text: string): string {
-  if (!text) return "";
-
-  // 1. Чистим эмодзи и нормализуем
-  let t = stripEmojis(text);
-  t = t.replace(/<br\s*\/?>/gi, "\n");
-  t = t.replace(/\r\n/g, "\n");
-
-  // 2. ВАЖНО: Разбиваем склеенные заголовки и разделители
-  // Если "===ТЕКСТ===Что-то ещё" — добавляем перенос
-  t = t.replace(/(===\s*[^=]+?\s*===)(?=\S)/g, "$1\n");
-  // Если "что-то===ЗАГОЛОВОК" — добавляем перенос
-  t = t.replace(/(\S)(===\s*[А-ЯA-Z])/g, "$1\n$2");
-  // Длинные дефисы-разделители прилипшие к тексту: "руб.---" → "руб.\n---"
-  t = t.replace(/([а-яa-zё.])(-{5,})/gi, "$1\n$2");
-  t = t.replace(/(-{5,})(\S)/g, "$1\n$2");
-  // Прилипшие markdown-таблицы
-  t = t.replace(/(\S)(\|\s*-{2,})/g, "$1\n$2");
-
-  const lines = t.split("\n");
-  const result: string[] = [];
-
-  // Собираем строки баров в группы
-  let barBuffer: BarLine[] = [];
-  let lastWasBar = false;
-
-  const flushBars = () => {
-    if (barBuffer.length === 0) return;
-
-    // Если в группе только 1 строка — не делаем диаграмму, рендерим как обычно
-    if (barBuffer.length === 1) {
-      const b = barBuffer[0];
-      let line = `${escapeHtmlStr(b.label)}: <span class="ai-num-badge">${escapeHtmlStr(b.rawValue)}</span>`;
-      if (b.unit) line += " " + escapeHtmlStr(b.unit);
-      result.push(line + "<br>");
-      barBuffer = [];
-      return;
-    }
-
-    // Полноценная диаграмма
-    const max = Math.max(...barBuffer.map(b => b.value));
-    let chart = '<div class="ai-bar-chart">';
-    barBuffer.forEach(b => {
-      const percent = max > 0 ? (b.value / max) * 100 : 0;
-      chart += `<div class="ai-bar-row">
-        <div class="ai-bar-label" title="${escapeHtmlStr(b.label)}">${escapeHtmlStr(b.label)}</div>
-        <div class="ai-bar-track"><div class="ai-bar-fill" style="width:${percent.toFixed(1)}%"></div></div>
-        <div class="ai-bar-value">${escapeHtmlStr(b.rawValue)}${b.unit ? " " + escapeHtmlStr(b.unit) : ""}</div>
-      </div>`;
-    });
-    chart += "</div>";
-    result.push(chart);
-    barBuffer = [];
+function parsePipeTable(
+  lines: string[],
+  startIdx: number
+): { html: string; consumed: number } | null {
+  const parseRow = (line: string): string[] | null => {
+    const t = line.trim();
+    if (!t.includes("|")) return null;
+    if (/^[\s|\-=+]+$/.test(t)) return null;
+    const inner = t.replace(/^\|/, "").replace(/\|$/, "");
+    const cells = inner.split("|").map(c =>
+      c.trim().replace(/^\[\s*/, "").replace(/\s*\]$/, "").trim()
+    );
+    if (cells.length < 2) return null;
+    return cells;
   };
 
+  const first = parseRow(lines[startIdx]);
+  if (!first) return null;
+
+  const rows: string[][] = [first];
+  let i = startIdx + 1;
+
+  if (
+    i < lines.length &&
+    /^[\s|\-=+]+$/.test(lines[i].trim()) &&
+    lines[i].includes("|")
+  ) {
+    i++;
+  }
+
+  while (i < lines.length) {
+    const r = parseRow(lines[i]);
+    if (!r) break;
+    if (r.length !== first.length) break;
+    rows.push(r);
+    i++;
+  }
+  if (rows.length < 2) return null;
+
+  const headers = rows[0];
+  const body = rows.slice(1);
+  return { html: buildTableHtml(headers, body), consumed: i - startIdx };
+}
+
+function preprocessTables(text: string): string {
+  const lines = text.split("\n");
+  const out: string[] = [];
   let i = 0;
+
+  // 1. Сначала склеиваем разорванные строки таблицы
   while (i < lines.length) {
     const line = lines[i];
     const trimmed = line.trim();
 
-    // 1. Markdown-таблица
-    const tableResult = parseMarkdownTable(lines, i);
-    if (tableResult) {
-      flushBars();
-      result.push(tableResult.html);
-      i += tableResult.consumed;
-      lastWasBar = false;
-      continue;
-    }
+    // Если строка содержит | и не является самостоятельной завершённой
+    const isPipeStart = trimmed.startsWith("|");
+    const isPipeOnly = /^\|+$/.test(trimmed); // просто "|" или "||"
+    const isBrokenSep = /^\|?-+\|?$/.test(trimmed); // "|---|" "---|" "|---"
 
-    // 2. Пустая строка
-    if (!trimmed) {
-      flushBars();
-      lastWasBar = false;
-      // Не добавляем лишние <br> после блочных
-      const last = result[result.length - 1];
-      if (last && !/<br>\s*$/.test(last) && !/<\/(div|table|hr|span)>\s*$/.test(last)) {
-        result.push("<br>");
+    if (isPipeStart || isPipeOnly || isBrokenSep) {
+      // Начинаем накапливать фрагменты таблицы
+      let merged = "";
+      let j = i;
+      let pipeCount = 0;
+
+      while (j < lines.length) {
+        const next = lines[j].trim();
+        if (!next) {
+          // пустая строка может разделять блоки внутри таблицы — смотрим вперёд
+          if (j + 1 < lines.length) {
+            const after = lines[j + 1].trim();
+            if (after.startsWith("|") || /^\|?-+\|?$/.test(after) || /^\|+$/.test(after)) {
+              j++;
+              continue;
+            }
+          }
+          break;
+        }
+
+        // Если следующая строка явно не часть таблицы (текст без |) — стоп
+        if (!next.includes("|") && !/^\|?-+\|?$/.test(next) && merged.length > 0) {
+          // Но если merged уже содержит шапку — это может быть строка данных без |
+          // Пропускаем такие случаи — рассмотрим отдельно
+          break;
+        }
+
+        merged += (merged ? " " : "") + next;
+        pipeCount += (next.match(/\|/g) || []).length;
+        j++;
+
+        // Если накопили достаточно много | подряд — это закончилась шапка/разделитель
+        // и мы готовы выйти, когда встретим не-pipe строку
       }
-      i++;
-      continue;
+
+      if (merged && pipeCount >= 2) {
+        // Чистим: убираем последовательные | без содержимого "||| |||" → "|"
+        // Превращаем "| | | |---|---|---|" в нормальный вид
+        let cleaned = merged
+          // схлопываем последовательности из | и пробелов в один | если между ними нет текста
+          .replace(/\|\s*\|/g, "|")
+          .replace(/\|\s*\|/g, "|") // повторно для тройных
+          .replace(/\s+/g, " ")
+          .trim();
+
+        // Теперь разделяем merged на: шапку, разделитель, данные
+        // Ищем "---" в строке
+        const dashMatch = cleaned.match(/(\|[\s\-:]*-+[\s\-:|]*?)+\|/);
+        if (dashMatch) {
+          const dashStart = cleaned.indexOf(dashMatch[0]);
+          const header = cleaned.substring(0, dashStart).trim();
+          const rest = cleaned.substring(dashStart + dashMatch[0].length).trim();
+
+          // Считаем количество колонок в шапке
+          const headerCells = header.replace(/^\|/, "").replace(/\|$/, "").split("|");
+          const colCount = headerCells.length;
+
+          if (header.startsWith("|") && colCount >= 2) {
+            out.push(header.endsWith("|") ? header : header + "|");
+            out.push("|" + Array(colCount).fill("---").join("|") + "|");
+
+            // rest — это данные. Они могут быть:
+            // a) " | Иванов | 80000 | ... | Петров | 70000 | ..."
+            // b) "ИВАНОВ И.И. 80 000 69 600 10 400 ПЕТРОВА А.С. 63 000 ..."
+
+            if (rest.includes("|")) {
+              // вариант (a): разбиваем по группам из colCount ячеек
+              const allCells = rest
+                .replace(/^\|/, "")
+                .replace(/\|$/, "")
+                .split("|")
+                .map(c => c.trim())
+                .filter(c => c.length > 0);
+
+              for (let k = 0; k < allCells.length; k += colCount) {
+                const row = allCells.slice(k, k + colCount);
+                if (row.length === colCount) {
+                  out.push("| " + row.join(" | ") + " |");
+                }
+              }
+            } else if (rest.length > 0) {
+              // вариант (b): нет | — разбиваем по словам/числам по colCount
+              // Это эвристика: каждое значение либо слово (включая инициалы), либо число с пробелами
+              const tokens = tokenizeRow(rest);
+              for (let k = 0; k < tokens.length; k += colCount) {
+                const row = tokens.slice(k, k + colCount);
+                if (row.length === colCount) {
+                  out.push("| " + row.join(" | ") + " |");
+                }
+              }
+            }
+          } else {
+            out.push(cleaned);
+          }
+        } else {
+          // Нет разделителя --- — просто отдаём как есть
+          out.push(cleaned);
+        }
+
+        i = j;
+        continue;
+      }
     }
 
-    // 3. Разделитель ---- или ====
-    if (/^[-=_]{4,}$/.test(trimmed)) {
-      flushBars();
-      result.push("<hr>");
-      i++;
-      lastWasBar = false;
-      continue;
-    }
-
-    // 4. === SECTION HEADER ===
-    const headerMatch = trimmed.match(/^===\s*(.+?)\s*===\s*$/);
-    if (headerMatch) {
-      flushBars();
-      result.push(`<div class="ai-section-header">${escapeHtmlStr(headerMatch[1])}</div>`);
-      i++;
-      lastWasBar = false;
-      continue;
-    }
-
-    // 5. ЗАГОЛОВОК ПРОПИСНЫМИ
-    if (trimmed.length > 3 && trimmed.length < 80 &&
-        trimmed === trimmed.toUpperCase() &&
-        /[А-ЯЁ]/.test(trimmed) &&
-        !/[.!?:]/.test(trimmed) &&
-        !/\d/.test(trimmed.substring(0, 5))) {
-      flushBars();
-      result.push(`<div class="ai-section-header">${escapeHtmlStr(trimmed)}</div>`);
-      i++;
-      lastWasBar = false;
-      continue;
-    }
-
-    // 6. Возможно бар-чарт строка?
-    // Условие: содержит блочные символы ИЛИ это группа подряд идущих "метка число"
-    const hasBarSymbols = isLikelyBarLine(trimmed);
-    const parsed = parseBarLine(trimmed);
-
-    if (hasBarSymbols && parsed) {
-      // Точно бар
-      barBuffer.push(parsed);
-      lastWasBar = true;
-      i++;
-      continue;
-    }
-
-    // Если предыдущая была баром и текущая тоже распознаётся как "метка число"
-    if (lastWasBar && parsed && parsed.value > 0) {
-      barBuffer.push(parsed);
-      i++;
-      continue;
-    }
-
-    // Не бар — сбрасываем буфер
-    flushBars();
-    lastWasBar = false;
-
-    // 7. Обычная строка
-    let processed = escapeHtmlStr(line);
-
-    // **bold**
-    processed = processed.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
-
-    // [числа] → бейдж
-    processed = processed.replace(/\[([\d][\d\s.,]*)\]/g, '<span class="ai-num-badge">$1</span>');
-
-    // Маркеры списков: "• ", "- ", "* ", "▪ "
-    const bulletMatch = trimmed.match(/^[•▪▫◦‣⁃\-\*]\s+(.+)$/);
-    if (bulletMatch) {
-      let content = escapeHtmlStr(bulletMatch[1]);
-      content = content.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
-      content = content.replace(/\[([\d][\d\s.,]*)\]/g, '<span class="ai-num-badge">$1</span>');
-      result.push(`<div class="ai-bullet">${content}</div>`);
-      i++;
-      continue;
-    }
-
-    result.push(processed + "<br>");
+    out.push(line);
     i++;
   }
 
-  flushBars();
+  return out.join("\n");
+}
 
-  let html = result.join("");
+// Разбиение строки на ячейки по эвристике: имена (со словами) + числа с пробелами
+function tokenizeRow(s: string): string[] {
+  const tokens: string[] = [];
+  // паттерн ячейки: ФИО (большая буква + слово + возможно инициалы) ИЛИ число с пробелами/запятой
+  // ФИО: "ИВАНОВ И.И." или "Иванов И.И." или "Иванов Иван Иванович"
+  // Число: "80 000" "1 234.56" "12,5"
+  const regex = /([А-ЯA-Z][а-яa-zА-ЯA-Z]*(?:\s+[А-ЯA-Z]\.?[А-ЯA-Z]?\.?)?|[А-ЯA-Z][а-яa-zА-ЯA-Z]+(?:\s+[А-ЯA-Z][а-яa-zА-ЯA-Z]+)*|\d{1,3}(?:[\s\u00A0]\d{3})*(?:[.,]\d+)?|\d+(?:[.,]\d+)?)/g;
+  let m;
+  while ((m = regex.exec(s)) !== null) {
+    tokens.push(m[1].trim());
+  }
+  return tokens;
+}
 
-  // Финальная зачистка: убираем <br> рядом с блочными элементами
-  html = html.replace(/<br>\s*(<(?:hr|div|table))/g, "$1");
-  html = html.replace(/(<\/(?:hr|div|table)>)\s*<br>/g, "$1");
-  html = html.replace(/(<br>\s*){3,}/g, "<br><br>");
-  // Удаляем <br> в самом начале и конце
-  html = html.replace(/^(<br>\s*)+/, "").replace(/(<br>\s*)+$/, "");
+// =====================================================================
+// ОСНОВНАЯ ФУНКЦИЯ
+// =====================================================================
+export function processAiText(input: string): string {
+  if (!input) return "";
+
+  let t = String(input);
+
+  t = t.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  t = t.replace(/\u200B|\uFEFF/g, "");
+  t = t.replace(/([А-ЯA-Zа-яa-z0-9)\]])[ \t]*[-–—]{2,}[ \t]*$/gm, "$1");
+  t = t.replace(/^[ \t]*[-–—\s]{5,}[ \t]*$/gm, "");
+  t = t.replace(/^[ \t]*[-–—][ \t]*$/gm, "");
+  t = t.replace(/(===\s*[^=\n]+?\s*===)(?=\S)/g, "$1\n");
+  t = t.replace(/(\S)(===\s*[^=\n])/g, "$1\n$2");
+  t = t.replace(/([^\s\-=])(-{4,}|={4,})/g, "$1\n$2");
+  t = t.replace(/(-{4,}|={4,})(?=\S)/g, "$1\n");
+  t = t.replace(
+    /(\S)\s*(\|\s*[^|\n]{1,80}\s*\|\s*[^|\n]{1,80}\s*\|)/g,
+    "$1\n$2"
+  );
+  t = t.replace(/\|\s*\|\s*([А-ЯA-Zа-яa-z0-9])/g, "|\n| $1");
+  t = t.replace(/([^\n])\s•\s/g, "$1\n• ");
+  t = t.replace(/([.:;])\s+-\s+/g, "$1\n- ");
+  t = t.replace(/\n{3,}/g, "\n\n");
+
+  // 🔥 НОВОЕ: склеиваем многострочные таблицы
+  t = preprocessTables(t);
+
+  const lines = t.split("\n");
+  const out: string[] = [];
+  let idx = 0;
+
+  while (idx < lines.length) {
+    const raw = lines[idx];
+    const line = raw.trim();
+
+    // Пустая строка
+    if (!line) {
+      out.push("");
+      idx++;
+      continue;
+    }
+
+    // Горизонтальный разделитель
+    if (/^[-=]{4,}$/.test(line)) {
+      out.push('<hr class="ai-sep"/>');
+      idx++;
+      continue;
+    }
+
+    // 1) Markdown-таблица с разделителем
+    const md = parseMarkdownTable(lines, idx);
+    if (md) {
+      out.push(md.html);
+      idx += md.consumed;
+      continue;
+    }
+
+    // 2) Псевдо-таблица из | … |
+    if (line.startsWith("|") && line.indexOf("|", 1) !== -1) {
+      const pipe = parsePipeTable(lines, idx);
+      if (pipe) {
+        out.push(pipe.html);
+        idx += pipe.consumed;
+        continue;
+      }
+    }
+
+    // 3) Заголовок === Текст ===
+    const headMatch = line.match(/^===\s*(.+?)\s*===$/);
+    if (headMatch) {
+      out.push(`<h3 class="ai-h3">${escapeHtmlStr(headMatch[1])}</h3>`);
+      idx++;
+      continue;
+    }
+
+    // 4) Markdown-заголовки ## / ###
+    const hashMatch = line.match(/^(#{1,4})\s+(.+)$/);
+    if (hashMatch) {
+      const level = Math.min(6, 2 + hashMatch[1].length);
+      out.push(
+        `<h${level} class="ai-h3">${inlineFormat(hashMatch[2])}</h${level}>`
+      );
+      idx++;
+      continue;
+    }
+
+    // 5) Маркированный список
+    if (/^[•\-*]\s+/.test(line)) {
+      const items: string[] = [];
+      while (idx < lines.length && /^[•\-*]\s+/.test(lines[idx].trim())) {
+        let item = lines[idx].trim().replace(/^[•\-*]\s+/, "");
+        item = item.replace(/[\s\-–—]+$/g, "");
+        if (item) items.push(item);
+        idx++;
+      }
+      out.push(
+        '<ul class="ai-list">' +
+          items.map(it => `<li>${inlineFormat(it)}</li>`).join("") +
+          "</ul>"
+      );
+      continue;
+    }
+
+    // 6) Нумерованный список
+    if (/^\d+[.)]\s+/.test(line)) {
+      const items: string[] = [];
+      while (idx < lines.length && /^\d+[.)]\s+/.test(lines[idx].trim())) {
+        items.push(lines[idx].trim().replace(/^\d+[.)]\s+/, ""));
+        idx++;
+      }
+      out.push(
+        '<ol class="ai-list">' +
+          items.map(it => `<li>${inlineFormat(it)}</li>`).join("") +
+          "</ol>"
+      );
+      continue;
+    }
+
+    // 7) Обычный абзац
+    out.push(`<p>${inlineFormat(line)}</p>`);
+    idx++;
+  }
+
+  let html = out.filter(x => x !== "").join("\n");
+  html = html.replace(/<p>\s*<\/p>/g, "");
 
   return html;
 }
@@ -330,6 +462,7 @@ export default function Home() {
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
   const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
   const [lastDocumentIds, setLastDocumentIds] = useState<string[]>([]);
+  const lastDocumentIdsRef = useRef<string[]>([]);
   const [authToken, setAuthToken] = useState<string | null>(null);
   const [currentUser, setCurrentUser] = useState<any>(null);
   const [backendOnline, setBackendOnline] = useState<boolean | null>(null);
@@ -385,14 +518,11 @@ export default function Home() {
   currentSessionIdRef.current = currentSessionId;
   const authTokenRef = useRef(authToken);
   authTokenRef.current = authToken;
-
+  
   // ── Load pinned from localStorage ──────────────────────────────────────
   useEffect(() => {
-    try {
-      const stored = localStorage.getItem(PINNED_KEY);
-      if (stored) setPinnedSessionIds(JSON.parse(stored));
-    } catch {}
-  }, []);
+    lastDocumentIdsRef.current = lastDocumentIds;
+  }, [lastDocumentIds]);
 
   const togglePinSession = useCallback((sessionId: string, e: React.MouseEvent) => {
     e.stopPropagation();
@@ -440,6 +570,7 @@ export default function Home() {
       id: "local_" + Date.now(),
       dbId: null,
       title,
+      documentIds: [],   // 🔥
       messages: [],
       createdAt: new Date(),
       lastActivity: new Date(),
@@ -505,19 +636,35 @@ export default function Home() {
     try {
       const sessions = await apiLoadSessions(token);
       if (!sessions.length) return;
-      const mapped: ChatSession[] = sessions.map((s: any) => ({
-        id: s.id, dbId: s.id, title: s.title || "Без названия",
-        messages: (s.messages || [])
-          .filter((m: any) => !TEMP_TEXTS.some((t) => m.text && m.text.startsWith(t)))
-          .map((m: any) => ({
-            id: m.id || Date.now() + Math.random() + "",
-            sender: m.sender === "user" || m.sender === "ai" ? m.sender : "ai",
-            text: m.text || "", isHtml: !!m.isHtml,
-            time: m.createdAt ? new Date(m.createdAt) : new Date(),
-          })),
-        createdAt: new Date(s.createdAt || Date.now()),
-        lastActivity: new Date(s.updatedAt || s.createdAt || Date.now()),
-      }));
+      const mapped: ChatSession[] = sessions.map((s: any) => {
+        // 🔥 парсим documentIds из БД
+        let documentIds: string[] = [];
+        try {
+          if (s.documentIds) {
+            documentIds = typeof s.documentIds === "string"
+              ? JSON.parse(s.documentIds)
+              : (Array.isArray(s.documentIds) ? s.documentIds : []);
+          }
+        } catch { documentIds = []; }
+  
+        return {
+          id: s.id,
+          dbId: s.id,
+          title: s.title || "Без названия",
+          documentIds,   // 🔥
+          messages: (s.messages || [])
+            .filter((m: any) => !TEMP_TEXTS.some((t) => m.text && m.text.startsWith(t)))
+            .map((m: any) => ({
+              id: m.id || Date.now() + Math.random() + "",
+              sender: m.sender === "user" || m.sender === "ai" ? m.sender : "ai",
+              text: m.text || "",
+              isHtml: !!m.isHtml,
+              time: m.createdAt ? new Date(m.createdAt) : new Date(),
+            })),
+          createdAt: new Date(s.createdAt || Date.now()),
+          lastActivity: new Date(s.updatedAt || s.createdAt || Date.now()),
+        };
+      });
       setChatSessions(mapped);
       chatSessionsRef.current = mapped;
     } catch (error) { console.error("[Session Restore] Error:", error); }
@@ -669,6 +816,65 @@ export default function Home() {
         window.removeEventListener("drop", handleDrop);
       };
     }, [addFilesToList, showToast]);
+
+    // PASTE из буфера
+    useEffect(() => {
+      const handlePaste = (e: ClipboardEvent) => {
+        // Не перехватываем, если фокус на input/textarea и пользователь вставляет текст
+        const target = e.target as HTMLElement;
+        const isTextInput = target && (
+          target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.isContentEditable
+        );
+
+        const items = e.clipboardData?.items;
+        if (!items) return;
+
+        const files: File[] = [];
+        for (let i = 0; i < items.length; i++) {
+          const item = items[i];
+          if (item.kind === "file") {
+            const file = item.getAsFile();
+            if (file) files.push(file);
+          }
+        }
+
+        if (files.length === 0) return;
+
+        // Если есть файлы — перехватываем paste даже в textarea
+        e.preventDefault();
+
+        const allowedExts = ["pdf", "docx", "doc", "xlsx", "xls", "csv", "txt", "jpg", "jpeg", "png", "gif", "webp"];
+        const validFiles = files.filter(f => {
+          const ext = f.name.split(".").pop()?.toLowerCase() || "";
+          // Для скриншотов из буфера часто имя "image.png" или вовсе без расширения
+          if (f.type.startsWith("image/")) return true;
+          return allowedExts.includes(ext);
+        }).map(f => {
+          // Если имя пустое или дефолтное "image.png" — даём осмысленное
+          if (!f.name || f.name === "image.png") {
+            const ext = f.type.split("/")[1] || "png";
+            return new File([f], `screenshot-${Date.now()}.${ext}`, { type: f.type });
+          }
+          return f;
+        });
+
+        if (validFiles.length === 0) {
+          showToast("Неподдерживаемый формат файла", "error");
+          return;
+        }
+
+        showToast(
+          `Вставлено ${validFiles.length} ${validFiles.length === 1 ? "файл" : "файла"} из буфера`,
+          "success"
+        );
+        addFilesToList(validFiles);
+      };
+
+      document.addEventListener("paste", handlePaste);
+      return () => document.removeEventListener("paste", handlePaste);
+    }, [addFilesToList, showToast]);
   
     // ── AI responders ───────────────────────────────────────────────────────
     const askYandex = useCallback(async (question: string, docIds: string[]) => {
@@ -740,13 +946,17 @@ export default function Home() {
     }, [askReport, askChart, askSummary, askExport, askYandex]);
   
     const executeCommand = useCallback(async (command: string, params: any = {}) => {
-      const documentId = lastDocumentIds.length ? lastDocumentIds[lastDocumentIds.length - 1] : null;
-      const needsDoc = !["compare"].includes(command) || lastDocumentIds.length >= 1;
-      if (!documentId && needsDoc) { showToast("Сначала загрузите документ", "error"); return; }
-  
+      const ids = lastDocumentIdsRef.current;
+      const documentId = ids.length ? ids[ids.length - 1] : null;
+      const needsDoc = !["compare"].includes(command) || ids.length >= 1;
+      if (!documentId && needsDoc) {
+        showToast("Сначала загрузите документ", "error");
+        return;
+      }
+    
       setView("chat");
       await addMessageToSession("user", COMMAND_LABELS[command] || command);
-  
+    
       if (["report", "chart", "excel", "pdf"].includes(command)) {
         const typeMap: Record<string, string> = { report: "all", chart: "charts", excel: "excel", pdf: "pdf" };
         await addMessageToSession("ai", "Генерирую отчёт...");
@@ -756,23 +966,23 @@ export default function Home() {
         else await addMessageToSession("ai", "Ошибка: " + (reportData.error || "Не удалось сгенерировать."));
         return;
       }
-  
+    
       if (command === "compare") {
-        if (lastDocumentIds.length < 2) {
+        if (ids.length < 2) {
           await addMessageToSession("ai", "Для сравнения нужно загрузить минимум 2 документа. Загрузите ещё один и повторите.");
           return;
         }
         await addMessageToSession("ai", "Сравниваю документы...");
         const result = await apiAskQuestion(
           "Сравни эти документы: выдели сходства, ключевые различия, покажи отличия в показателях и сделай вывод.",
-          lastDocumentIds.slice(-2)
+          ids.slice(-2)
         );
         removeTempMessage();
         if (result.success) await addMessageToSession("ai", processAiText(result.answer), true);
         else await addMessageToSession("ai", "Ошибка: " + result.error);
         return;
       }
-  
+    
       await addMessageToSession("ai", "Выполняю команду...");
       const result = await apiRunCommand(command, documentId!, params);
       removeTempMessage();
@@ -782,14 +992,14 @@ export default function Home() {
         else if (data?.text) await addMessageToSession("ai", processAiText(data.text), true);
         else await addMessageToSession("ai", "Команда выполнена, но данные не получены.");
       } else await addMessageToSession("ai", "Ошибка: " + (result.error || "Ошибка выполнения команды"));
-    }, [lastDocumentIds, showToast, addMessageToSession, removeTempMessage]);
+    }, [showToast, addMessageToSession, removeTempMessage]);
   
     const sendMessage = useCallback(async () => {
       const files = [...attachedFiles];
       const text = inputText.trim();
       const hasFiles = files.length > 0;
       if (!text && !hasFiles) return;
-  
+    
       setView("chat");
       setInputText("");
       if (chatInputRef.current) { chatInputRef.current.value = ""; chatInputRef.current.style.height = "auto"; }
@@ -797,7 +1007,7 @@ export default function Home() {
       if (fileUploadRef.current) fileUploadRef.current.value = "";
       if (cameraRef.current) cameraRef.current.value = "";
       if (galleryRef.current) galleryRef.current.value = "";
-  
+    
       if (hasFiles) {
         const fileMeta = files.map((f) => ({ name: f.name, size: f.size }));
         await addMessageToSession("user", text, false, fileMeta);
@@ -808,9 +1018,23 @@ export default function Home() {
           if (result.success && result.data.id) newIds.push(result.data.id);
         }
         removeTempMessage();
-        if (!newIds.length) { await addMessageToSession("ai", "Не удалось загрузить файлы. Проверьте формат."); return; }
-        const updatedDocIds = [...new Set([...lastDocumentIds, ...newIds])];
+        if (!newIds.length) {
+          await addMessageToSession("ai", "Не удалось загрузить файлы.");
+          return;
+        }
+        const updatedDocIds = [...new Set([...lastDocumentIdsRef.current, ...newIds])];
+        lastDocumentIdsRef.current = updatedDocIds;
         setLastDocumentIds(updatedDocIds);
+    
+        const session = getCurrentSession();
+        if (session?.dbId && authTokenRef.current) {
+          await apiUpdateSessionDocuments(authTokenRef.current, session.dbId, updatedDocIds);
+          const next = chatSessionsRef.current.map(s =>
+            s.id === session.id ? { ...s, documentIds: updatedDocIds } : s
+          );
+          setChatSessions(next);
+          chatSessionsRef.current = next;
+        }
         if (text) await routeAiRequest(text, updatedDocIds);
         else await addMessageToSession("ai",
           (files.length > 1 ? `${files.length} файла загружено` : `«${files[0].name}» загружен`) +
@@ -818,9 +1042,9 @@ export default function Home() {
         );
       } else {
         await addMessageToSession("user", text);
-        await routeAiRequest(text, lastDocumentIds);
+        await routeAiRequest(text, lastDocumentIdsRef.current);
       }
-    }, [attachedFiles, inputText, lastDocumentIds, addMessageToSession, removeTempMessage, routeAiRequest]);
+    }, [attachedFiles, inputText, addMessageToSession, removeTempMessage, routeAiRequest, getCurrentSession]);
   
     const autoUploadFromCamera = useCallback(async (file: File) => {
       setAttachedFiles((prev) => prev.filter((f) => !(f.name === file.name && f.size === file.size)));
@@ -832,7 +1056,21 @@ export default function Home() {
       removeTempMessage();
       if (result.success) {
         const d = result.data;
-        if (d.id) setLastDocumentIds((prev) => [...new Set([...prev, d.id])]);
+        if (d.id) {
+          setLastDocumentIds((prev) => {
+            const next = [...new Set([...prev, d.id])];
+            const session = getCurrentSession();
+            if (session?.dbId && authTokenRef.current) {
+              apiUpdateSessionDocuments(authTokenRef.current, session.dbId, next);
+              const updated = chatSessionsRef.current.map(s =>
+                s.id === session.id ? { ...s, documentIds: next } : s
+              );
+              setChatSessions(updated);
+              chatSessionsRef.current = updated;
+            }
+            return next;
+          });
+        }
         await addMessageToSession("ai",
           `«${file.name}» загружен!\n` +
           (d.extractedText ? "Задайте вопрос или выберите команду слева!" : "Текст не удалось извлечь.")
@@ -846,7 +1084,9 @@ export default function Home() {
       if (!session) return;
       setCurrentSessionId(sessionId);
       currentSessionIdRef.current = sessionId;
-      setLastDocumentIds([]);
+      const docIds = session.documentIds || [];
+      lastDocumentIdsRef.current = docIds;
+      setLastDocumentIds(docIds);
       clearAttachedFiles();
       setView("chat");
       setChatMessages(session.messages.map((m) => ({ ...m, time: m.time instanceof Date ? m.time : new Date(m.time) })));
@@ -856,6 +1096,7 @@ export default function Home() {
   
     const handleNavNewDoc = useCallback(() => {
       setCurrentSessionId(null); currentSessionIdRef.current = null;
+      lastDocumentIdsRef.current = [];
       setLastDocumentIds([]); clearAttachedFiles(); setChatMessages([]); setView("welcome");
       if (chatInputRef.current) chatInputRef.current.focus();
       if (window.innerWidth <= 768) setSidebarOpen(false);
@@ -947,6 +1188,7 @@ export default function Home() {
       setLoggedOut();
       setChatSessions([]); chatSessionsRef.current = [];
       setCurrentSessionId(null); currentSessionIdRef.current = null;
+      lastDocumentIdsRef.current = [];
       setLastDocumentIds([]); clearAttachedFiles(); setChatMessages([]); setView("welcome");
       setProfileModalOpen(false); showToast("Вы вышли из аккаунта");
     }, [setLoggedOut, clearAttachedFiles, showToast]);
@@ -960,6 +1202,7 @@ export default function Home() {
         setLoggedOut(); setDeleteModalOpen(false);
         setChatSessions([]); chatSessionsRef.current = [];
         setCurrentSessionId(null); currentSessionIdRef.current = null;
+        lastDocumentIdsRef.current = [];
         setLastDocumentIds([]); clearAttachedFiles(); setChatMessages([]); setView("welcome");
         showToast("Аккаунт удалён", "error");
     } else { showToast("Ошибка удаления аккаунта", "error"); setDeleteModalOpen(false); }
@@ -977,6 +1220,7 @@ export default function Home() {
     });
     if (currentSessionIdRef.current === item.id) {
       setCurrentSessionId(null); currentSessionIdRef.current = null;
+      lastDocumentIdsRef.current = [];
       setLastDocumentIds([]); setChatMessages([]); setView("welcome");
     }
   }, []);

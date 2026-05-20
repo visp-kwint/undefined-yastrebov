@@ -23,6 +23,8 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 app.use(express.static(path.join(__dirname, '../public')));
 
+
+
 // API Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/upload', uploadRoutes);
@@ -33,6 +35,8 @@ app.use('/api/test', testRoutes);
 app.use('/api/chat', chatRoutes);
 app.use('/api/reports', reportRoutes);
 app.use('/api/commands', commandRoutes);
+
+app.use('/reports', express.static(path.join(__dirname, '../public/reports')));
 
 app.get('/api/health', (req, res) => {
   res.json({

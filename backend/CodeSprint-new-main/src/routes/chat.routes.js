@@ -83,4 +83,17 @@ router.delete('/sessions/:id', requireAuth, async (req, res) => {
   }
 });
 
+router.patch('/sessions/:id/documents', requireAuth, async (req, res) => {
+  try {
+    const { documentIds } = req.body;
+    const session = await prisma.chatSession.update({
+      where: { id: req.params.id },
+      data: { documentIds: JSON.stringify(documentIds || []) }
+    });
+    res.json({ session });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 module.exports = router;

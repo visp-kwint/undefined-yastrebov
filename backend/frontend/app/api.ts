@@ -1,5 +1,10 @@
 import { ApiResult } from "./types";
 
+function authHeaders(): Record<string, string> {
+  const token = typeof window !== "undefined" ? localStorage.getItem("docmind_token") : null;
+  return token ? { Authorization: "Bearer " + token } : {};
+}
+
 export async function apiRegister(email: string, password: string): Promise<ApiResult> {
   const res = await fetch("/api/auth/register", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email, password }) });
   return { ok: res.ok, status: res.status, data: await res.json() };
@@ -87,7 +92,11 @@ export async function apiAskQuestion(question: string, docIds: string[]) {
     const body: any = { question };
     if (docIds.length === 1) body.documentId = docIds[0];
     else if (docIds.length > 1) { body.documentIds = docIds; body.documentId = docIds[docIds.length - 1]; }
-    const res = await fetch("/api/ask", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const res = await fetch("/api/ask", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(body)
+    });
     if (res.ok) {
       const data = await res.json();
       return { success: true, answer: (data.data && data.data.answer) || data.answer || data.response || JSON.stringify(data) };
@@ -98,7 +107,11 @@ export async function apiAskQuestion(question: string, docIds: string[]) {
 
 export async function apiGenerateReport(documentId: string, type = "all") {
   try {
-    const res = await fetch("/api/reports/generate", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ documentId, type }) });
+    const res = await fetch("/api/reports/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ documentId, type })
+    });
     if (res.ok) {
       const data = await res.json();
       return { success: true, data: data.data || data };
@@ -107,18 +120,16 @@ export async function apiGenerateReport(documentId: string, type = "all") {
   } catch (e: any) { return { success: false, error: e.message }; }
 }
 
-// CRITICAL FIX: backend returns { success: true, data: { text/html } }
-// Old code returned { success: true, data: { success: true, data: { text } } } — wrong nesting
+
 export async function apiRunCommand(command: string, documentId: string, params = {}) {
   try {
     const res = await fetch("/api/commands/run", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...authHeaders() },
       body: JSON.stringify({ command, documentId, params }),
     });
     if (res.ok) {
       const json = await res.json();
-      // Unwrap: backend sends { success: true, data: { text: "..." } }
       return { success: true, data: json.data ?? json };
     }
     const err = await res.json().catch(() => ({}));
@@ -126,4 +137,14 @@ export async function apiRunCommand(command: string, documentId: string, params 
   } catch (e: any) {
     return { success: false, error: e.message };
   }
+}
+
+export async function apiUpdateSessionDocuments(token: string, sessionId: string, documentIds: string[]) {
+  try {
+    await fetch("/api/chat/sessions/" + sessionId + "/documents", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
+      body: JSON.stringify({ documentIds })
+    });
+  } catch {}
 }

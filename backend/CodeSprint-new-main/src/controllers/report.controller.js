@@ -3,6 +3,17 @@ const prisma = new PrismaClient();
 const fs = require('fs');
 const path = require('path');
 
+const jwt = require('jsonwebtoken');
+const JWT_SECRET = process.env.JWT_SECRET || 'docmind-secret-key-change-in-production';
+
+function getUserIdFromReq(req) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return null;
+  try {
+    return jwt.verify(authHeader.replace('Bearer ', ''), JWT_SECRET).userId;
+  } catch { return null; }
+}
+
 // ========== Генерация диаграмм (canvas) ==========
 const generatePieChart = (labels, data, title) => {
   const { createCanvas } = require('canvas');
@@ -140,42 +151,137 @@ const generateBarChart = (labels, data, title, yLabel) => {
 // ========== Парсинг документа ==========
 function parseDocumentData(doc) {
   const text = doc.extractedText || '';
-  const lines = text.split('\n').filter(l => l.trim());
-
-  const tables = [];
-  let currentTable = [];
-
-  lines.forEach(line => {
-    const cells = line.split(/\s{2,}|\t|,|;/).map(c => c.trim()).filter(c => c);
-    if (cells.length >= 2 && cells.length <= 12) {
-      currentTable.push(cells);
-    } else if (currentTable.length > 0) {
-      if (currentTable.length > 1) tables.push([...currentTable]);
-      currentTable = [];
-    }
-  });
-  if (currentTable.length > 1) tables.push(currentTable);
-
-  if (tables.length === 0) {
-    return {
-      headers: ['Сотрудник', 'Должность', 'Оклад', 'Начислено', 'НДФЛ', 'К выплате'],
-      rows: [
-        ['Иванов И.И.', 'Разработчик', '80000', '80000', '10400', '69600'],
-        ['Петрова А.С.', 'Аналитик', '70000', '63000', '8190', '54810'],
-        ['Сидоров В.П.', 'Тестировщик', '60000', '60000', '7800', '52200'],
-        ['Козлова Е.М.', 'Менеджер', '75000', '56250', '7313', '48938'],
-        ['Новиков Д.А.', 'Стажёр', '40000', '40000', '5200', '34800']
-      ]
-    };
+  if (!text.trim()) {
+    return makeEmptyFallback(doc, text);
   }
 
-  const table = tables[0];
+  // Стратегия 1: вертикальная таблица DOCX (ячейки через \n\n)
+  const verticalResult = parseVerticalTable(text);
+  if (verticalResult && verticalResult.rows.length > 0) {
+    console.log(`[parseDocumentData] Вертикальная таблица: ${verticalResult.rows.length} строк, ${verticalResult.headers.length} колонок`);
+    return { headers: verticalResult.headers, rows: verticalResult.rows, empty: false };
+  }
+
+  // Стратегия 2: построчная таблица (разделители — 2+ пробела, табы, запятые)
+  const horizontalResult = parseHorizontalTable(text);
+  if (horizontalResult && horizontalResult.rows.length > 0) {
+    console.log(`[parseDocumentData] Горизонтальная таблица: ${horizontalResult.rows.length} строк`);
+    return { headers: horizontalResult.headers, rows: horizontalResult.rows, empty: false };
+  }
+
+  // Fallback: метаданные
+  console.log('[parseDocumentData] Таблицы не распознаны, возвращаем метаданные');
+  return makeEmptyFallback(doc, text);
+}
+
+function makeEmptyFallback(doc, text) {
   return {
-    headers: table[0] || [],
-    rows: table.slice(1) || []
+    headers: ['Параметр', 'Значение'],
+    rows: [
+      ['Документ', doc.originalName || 'Без названия'],
+      ['Размер', (doc.size / 1024).toFixed(1) + ' KB'],
+      ['Тип', doc.mimeType || 'неизвестно'],
+      ['Извлечено символов', String(text.length)],
+      ['Примечание', 'Структурированные таблицы в документе не обнаружены']
+    ],
+    empty: true
   };
 }
 
+// Парсинг вертикальной таблицы (DOCX: ячейки разделены \n\n)
+function parseVerticalTable(text) {
+  const cells = text.split(/\n\s*\n/).map(c => c.trim()).filter(c => c.length > 0);
+  if (cells.length < 6) return null;
+
+  // Ищем "№" — начало таблицы
+  let startIdx = cells.findIndex(c => c === '№' || /^№$/.test(c));
+  if (startIdx === -1) {
+    // Пробуем найти по ключевым словам в первых ячейках
+    startIdx = cells.findIndex(c => /^(ФИО|Сотрудник|Наименование|Показатель)$/i.test(c));
+    if (startIdx === -1) return null;
+  }
+
+  // Определяем количество колонок: ищем подряд идущие "заголовочные" ячейки
+  // (короткие, без пробелов в начале, до первой ячейки с числом-индексом строки)
+  const standardKeywords = ['ФИО', 'Должность', 'Оклад', 'Начислено', 'НДФЛ', 'К выплате', 'Удержано',
+                            'Сотрудник', 'Сумма', 'Дата', 'Количество', 'Цена', 'Итого', 'Отработано'];
+
+  let headers = [];
+  let dataStartIdx = startIdx;
+
+  // Берём ячейки начиная со startIdx и идём пока не встретим "1" (первая строка данных)
+  for (let i = startIdx; i < Math.min(startIdx + 15, cells.length); i++) {
+    const cell = cells[i];
+    // Если встретили чистое число 1-3 цифр после хотя бы одного заголовка — это начало данных
+    if (headers.length >= 2 && /^\d{1,3}$/.test(cell)) {
+      dataStartIdx = i;
+      break;
+    }
+    headers.push(cell);
+  }
+
+  if (headers.length < 2) return null;
+
+  const colCount = headers.length;
+
+  // Собираем строки данных по colCount ячеек
+  const rows = [];
+  for (let i = dataStartIdx; i + colCount - 1 < cells.length; i += colCount) {
+    const row = cells.slice(i, i + colCount);
+
+    // Проверка: первая ячейка должна быть номером или коротким значением
+    // и в строке должны быть какие-то осмысленные данные
+    const firstCell = row[0];
+    const isValidRow = /^\d{1,4}$/.test(firstCell) ||
+                      (row.length === colCount && !row.some(c => c.length > 200));
+
+    if (!isValidRow) break;
+
+    // Стоп-слова: если встретили служебный текст
+    if (row.some(c => /^(ПОДПИСИ|Расчёт составил|Проверил|Утверждаю|Итого)$/i.test(c))) {
+      break;
+    }
+
+    rows.push(row);
+  }
+
+  if (rows.length === 0) return null;
+
+  return { headers, rows };
+}
+
+// Парсинг горизонтальной таблицы (одна запись = одна строка с разделителями)
+function parseHorizontalTable(text) {
+  const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+  const rows = [];
+  let headers = [];
+  let foundHeader = false;
+
+  for (const line of lines) {
+    if (/(ПОДПИСИ|Расчёт составил|Проверил|Утверждаю|____)/i.test(line)) continue;
+
+    const cells = line.split(/\s{2,}|\t|;/).map(c => c.trim()).filter(c => c);
+
+    if (cells.length >= 3 && cells.length <= 12) {
+      if (!foundHeader) {
+        // Первая длинная строка с 3+ ячейками — заголовок
+        headers = cells;
+        foundHeader = true;
+      } else {
+        // Строка данных — должна иметь столько же ячеек
+        if (cells.length === headers.length) {
+          rows.push(cells);
+        }
+      }
+    }
+  }
+
+  if (rows.length === 0 || headers.length === 0) return null;
+
+  return { headers, rows };
+}
+
+// ========== Основной контроллер ==========
 // ========== Основной контроллер ==========
 const generateReport = async (req, res) => {
   try {
@@ -187,21 +293,31 @@ const generateReport = async (req, res) => {
 
     console.log('Ищем документ с ID:', documentId);
 
-    const doc = await prisma.document.findUnique({
-      where: { id: documentId }
+    const userId = getUserIdFromReq(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: 'Требуется авторизация' });
+    }
+
+    const doc = await prisma.document.findFirst({
+      where: { id: documentId, userId }
     });
 
     console.log('Найден документ:', doc ? doc.originalName : 'не найден');
 
     if (!doc) {
-      return res.status(404).json({ success: false, message: 'Документ не найден' });
+      return res.status(404).json({ success: false, message: 'Документ не найден или нет доступа' });
     }
 
     const data = parseDocumentData(doc);
 
-    // Безопасная сборка результата: массив файлов собираем отдельно
     const reportFiles = [];
-    const reportText = 'Отчёт сгенерирован на основе документа: ' + (doc.originalName || 'Неизвестный документ');
+    let reportText = 'Отчёт сгенерирован на основе документа: ' + (doc.originalName || 'Неизвестный документ');
+
+    if (data.empty) {
+      reportText += '\n\n⚠️ Внимание: в документе не обнаружены структурированные таблицы. ' +
+                    'Сгенерирован отчёт с метаданными документа. ' +
+                    'Для полноценной аналитики загрузите документ с табличными данными (Excel, ведомость, баланс и т.п.).';
+    }
 
     const reportsDir = path.join(__dirname, '../../public/reports');
     if (!fs.existsSync(reportsDir)) {
@@ -218,8 +334,13 @@ const generateReport = async (req, res) => {
       return isNaN(val) ? 0 : val;
     });
 
+    // 🔥 Можем генерить диаграммы только если есть реальные числовые данные
+    const canGenerateCharts = !data.empty &&
+                              nets.some(v => v > 0) &&
+                              accrued.some(v => v > 0);
+
     // Генерация диаграмм
-    if (type === 'all' || type === 'charts') {
+    if ((type === 'all' || type === 'charts') && canGenerateCharts) {
       try {
         const pieBuffer = generatePieChart(names, nets, 'Структура выплат по сотрудникам');
         const piePath = path.join(reportsDir, `chart-pie-${Date.now()}.png`);
@@ -237,10 +358,12 @@ const generateReport = async (req, res) => {
       } catch (chartErr) {
         console.error('Bar chart error:', chartErr.message);
       }
+    } else if ((type === 'all' || type === 'charts') && !canGenerateCharts) {
+      console.log('Пропуск генерации диаграмм: нет числовых данных');
     }
 
     // Генерация PDF
-    if (type === 'all' || type === 'pdf') {
+    if ((type === 'all' || type === 'pdf')) {
       try {
         const PDFDocument = require('pdfkit');
         const pdfDoc = new PDFDocument();
@@ -254,30 +377,43 @@ const generateReport = async (req, res) => {
           pdfDoc.font('ArialCyrillic');
         }
 
-        pdfDoc.fontSize(20).text('ОТЧЁТ ПО ЗАРАБОТНОЙ ПЛАТЕ', 50, 50);
+        const titleText = data.empty ? 'ОТЧЁТ ПО ДОКУМЕНТУ' : 'ОТЧЁТ ПО ЗАРАБОТНОЙ ПЛАТЕ';
+        pdfDoc.fontSize(20).text(titleText, 50, 50);
         pdfDoc.fontSize(12).text('На основе документа: ' + (doc.originalName || 'Неизвестный'), 50, 80);
+
+        if (data.empty) {
+          pdfDoc.fontSize(10).fillColor('#888888').text(
+            'Структурированные таблицы в документе не обнаружены. ' +
+            'Отображены метаданные документа.',
+            50, 105, { width: 500 }
+          );
+        }
+
         pdfDoc.moveDown(2);
 
-        pdfDoc.fontSize(14).text('ТАБЛИЦА РАСЧЁТА', 50, 120);
+        pdfDoc.fontSize(14).fillColor('#000000').text(
+          data.empty ? 'СВЕДЕНИЯ О ДОКУМЕНТЕ' : 'ТАБЛИЦА РАСЧЁТА',
+          50, 140
+        );
         pdfDoc.moveDown();
 
-        const tableTop = 160;
-        const colWidth = 80;
+        const tableTop = 180;
+        const colWidth = data.empty ? 200 : 80;
         const headers = data.headers;
 
         pdfDoc.fontSize(10).fillColor('#333333');
         headers.forEach((header, i) => {
-          pdfDoc.text(header, 50 + i * colWidth, tableTop);
+          pdfDoc.text(String(header), 50 + i * colWidth, tableTop);
         });
 
         data.rows.forEach((row, i) => {
           const y = tableTop + 25 + (i * 20);
           row.forEach((cell, j) => {
-            pdfDoc.text(String(cell), 50 + j * colWidth, y);
+            pdfDoc.text(String(cell), 50 + j * colWidth, y, { width: colWidth - 10 });
           });
         });
 
-        if (type === 'all') {
+        if (type === 'all' && canGenerateCharts) {
           pdfDoc.addPage();
           pdfDoc.fontSize(16).text('ДИАГРАММЫ', 50, 50);
 
@@ -319,9 +455,9 @@ const generateReport = async (req, res) => {
         const worksheet = workbook.addWorksheet('Отчёт');
 
         worksheet.columns = data.headers.map((h, i) => ({
-          header: h,
+          header: String(h),
           key: `col${i}`,
-          width: 20
+          width: data.empty ? 35 : 20
         }));
 
         worksheet.getRow(1).font = { bold: true, size: 12 };
@@ -337,12 +473,12 @@ const generateReport = async (req, res) => {
       }
     }
 
-    // Финальный ответ — собираем ОДИН раз, исключая undefined
     const result = {
       success: true,
       data: {
         text: reportText,
-        files: reportFiles
+        files: reportFiles,
+        empty: data.empty
       }
     };
 

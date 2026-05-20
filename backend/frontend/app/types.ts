@@ -16,6 +16,7 @@ export interface ChatSession {
   id: string;
   dbId: string | null;
   title: string;
+  documentIds: string[];
   messages: ChatMessage[];
   createdAt: Date;
   lastActivity: Date;

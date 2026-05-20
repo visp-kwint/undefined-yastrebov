@@ -12,6 +12,17 @@ const httpsAgent = new https.Agent({ keepAlive: false });
 
 const DEFAULT_MODEL = process.env.OPENROUTER_MODEL || 'baidu/cobuddy:free';
 
+const jwt = require('jsonwebtoken');
+const JWT_SECRET = process.env.JWT_SECRET || 'docmind-secret-key-change-in-production';
+
+function getUserIdFromReq(req) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return null;
+  try {
+    return jwt.verify(authHeader.replace('Bearer ', ''), JWT_SECRET).userId;
+  } catch { return null; }
+}
+
 async function axiosPostWithRetry(url, data, headers, maxRetries = 3) {
   let lastError;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -146,11 +157,16 @@ const askQuestion = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Не передан ID документа' });
     }
 
+    const userId = getUserIdFromReq(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: 'Требуется авторизация' });
+    }
+
     const docs = await prisma.document.findMany({
-      where: { id: { in: uniqueIds } }
+      where: { id: { in: uniqueIds }, userId }   // <-- фильтр по userId
     });
     if (!docs.length) {
-      return res.status(404).json({ success: false, message: 'Документы не найдены' });
+      return res.status(404).json({ success: false, message: 'Документы не найдены или нет доступа' });
     }
 
     let combinedText = '';
@@ -173,13 +189,17 @@ const askQuestion = async (req, res, next) => {
     // Проверяем, просит ли пользователь диаграмму
     const lowerQuestion = question.toLowerCase();
     const wantsChart = lowerQuestion.includes('диаграмм') || lowerQuestion.includes('график') || 
-                       lowerQuestion.includes('chart') || lowerQuestion.includes('визуализ');
+                      lowerQuestion.includes('chart') || lowerQuestion.includes('визуализ');
 
     const systemPrompt = `Ты — профессиональный AI-ассистент для бухгалтеров и экономистов. Отвечай на вопросы ТОЛЬКО на основе предоставленного текста из ${docsLabel}.
 
 ПРАВИЛА ФОРМАТИРОВАНИЯ ОТВЕТА:
 1. Заголовки выделяй ПРОПИСНЫМИ БУКВАМИ или через линии ===
-2. Таблицы оформляй через символы псевдографики: | - + 
+2. Таблицы оформляй СТРОГО в Markdown-формате на ОДНОЙ строке для каждой записи:
+  | Заголовок1 | Заголовок2 | Заголовок3 |
+  |---|---|---|
+  | Значение1  | Значение2  | Значение3  |
+  НЕ переноси ячейки на новые строки. НЕ оборачивай числа в [ ].
 3. Списки оформляй через • или ->
 4. Важные цифры и суммы выделяй [ ] скобками
 5. Разделители между блоками делай через линию ---------------
@@ -189,6 +209,7 @@ const askQuestion = async (req, res, next) => {
 9. Отвечай развернуто, красиво и по делу
 10. Для бухгалтерских расчётов показывай промежуточные шаги
 11. Указывай статьи НК РФ и другие нормативные акты, если они упоминаются в документе
+12. Делай диаграммы в текстовом виде если поступает запрос
 
 Текст документов:
 ${trimmedText}`;
